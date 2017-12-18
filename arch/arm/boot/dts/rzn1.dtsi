@@ -103,6 +103,13 @@
 			compatible = "renesas,rzn1-clock-group";
 			clocks = <&hclk_lcd &hclk_pg_i>;
 		};
+        
+        clk_hsr_all: clk_hsr_all {
+			#clock-cells = <0>;
+			compatible = "renesas,rzn1-clock-group";
+			clocks = <&clk_hsr &clk_hsr50 &hclk_hsr>;
+        };
+        
 		clk_switch_all: clk_switch_all {
 			#clock-cells = <0>;
 			compatible = "renesas,rzn1-clock-group";
@@ -525,6 +532,20 @@
 			clock-names = "fck";
 			clocks = <&clk_switch_all>;
 			status = "disabled";
+		};
+		eth_hsr: eth-hsr@0x44040000 {
+			compatible = "zhaw,hsr";
+			#address-cells = <1>;
+			#size-cells = <0>;
+			reg = <0x44040000 0x8000>,
+			      <0x44048000 0x4000>,
+			      <0x4404C000 0x4000>;
+			status = "disabled";
+			clock-names = "100MHz", "50MHz", "apb_pclk";
+			clocks = <&clk_hsr_dup>, <&clk_hsr50>, <&hclk_hsr>;
+			interrupt-parent = <&gic>;
+			interrupts = <GIC_SPI RZN1_IRQ_HSR_PTP IRQ_TYPE_LEVEL_HIGH>, <GIC_SPI RZN1_IRQ_HSR_CPU IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "ptp_irq", "cpu_irq";
 		};
 		eth_miic: eth-miic@RZN1_SWITCH_CTRL_REG_BASE {
 			compatible = "renesas,rzn1-miic";

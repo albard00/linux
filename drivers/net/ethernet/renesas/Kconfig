@@ -49,4 +49,9 @@ config RZN1_MIIC
 	  The Renesas RZ/N1 device uses an RGMII/GMII Convertor (MIIC) on each
 	  ethernet PHY interface.
 
+config ZHAW_HSR_SWITCH
+	tristate "ZHAW HSR switch"
+	---help---
+	  ZHAW HSR switch.
+
 endif # NET_VENDOR_RENESAS

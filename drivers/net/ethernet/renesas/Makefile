@@ -8,3 +8,4 @@ ravb-objs := ravb_main.o ravb_ptp.o
 
 obj-$(CONFIG_RAVB) += ravb.o
 obj-$(CONFIG_RZN1_MIIC) += rzn1_miic.o
+obj-$(CONFIG_ZHAW_HSR_SWITCH) += zhaw_hsr.o

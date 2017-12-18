@@ -18,6 +18,11 @@
 &ethswitch {
 	status = "okay";
 };
+&eth_hsr {
+	status = "okay";
+};
 &eth_miic {
 	status = "okay";
+	/* RIN Mode Control - GMAC1 via Switch on ports 1,2, HSR on port 3,4 */
+	mode_control = <0x1d>;
 };
