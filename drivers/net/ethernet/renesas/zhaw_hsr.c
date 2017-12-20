@@ -11,6 +11,7 @@
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/etherdevice.h>
+#include <linux/netdevice.h>
 #include <linux/module.h>
 #include <linux/of_address.h>
 #include <linux/of_net.h>
@@ -23,7 +24,6 @@
 #include "zhaw_hsr.h"
 
 struct zhaw_hsr {
-	struct device *dev;
 	struct net_device * ndev;
 	void __iomem *regs_cpu;
 	void __iomem *regs;
@@ -830,33 +830,47 @@ static bool zhaw_hsr_is_node_in_table(uint8_t * mac){
 
 	return false;
 }
+static void zhaw_hsr_rx(struct net_device * dev, uint8_t * data, int datalen){
+	struct sk_buff *skb;
+	skb = netdev_alloc_skb_ip_align(dev, datalen);
+	if (!skb) {
+		if (printk_ratelimit(  ))
+			printk(KERN_NOTICE "zhaw_hsr_rx: low on mem - packet dropped\n");
+		dev->stats.rx_dropped++;
+		goto out;
+	}
+	skb_copy_to_linear_data(skb, data, datalen);
+	skb_put(skb, datalen);
+	/* Write metadata, and then pass to the receive level */
+	skb->protocol = eth_type_trans(skb, dev);
+	skb->ip_summed = CHECKSUM_UNNECESSARY; /* don't check it */
+	dev->stats.rx_packets++;
+	dev->stats.rx_bytes += datalen;
+	netif_rx(skb);
+out:
+	return;
+}
 static irqreturn_t zhaw_hsr_irq(int a, void* dev){
-	struct zhaw_hsr *hsr_data = dev_get_drvdata(dev);
-	struct net_device * ndev = hsr_data->ndev;
+	struct net_device * ndev = dev;
+	struct zhaw_hsr *hsr_data = dev_get_drvdata(&ndev->dev);
 	uint32_t __iomem * p_rci_rconfig = hsr_data->regs_cpu + 4;
 	uint32_t __iomem * p_rci_int = hsr_data->regs_cpu + 8;
 	uint32_t __iomem * rci_txrx_data = hsr_data->regs_cpu + 0xC;
-	uint32_t rci_int = *p_rci_int;
-	struct sk_buff *skb;
-	unsigned long irqflags;
-	//spin_lock_irqsave(&ioread_lock, irqflags); 
+	uint32_t rci_int = ioread32(p_rci_int);
+	//unsigned long irqflags;
+	//spin_lock_irqsave(&ioread_lock, irqflags);
 
 	if(rci_int & 0x1) { // RX interrupt
 		union REG_RCI_RCONFIG rci_rconfig;
-		rci_rconfig.LONG = *p_rci_rconfig;
-		if(rci_rconfig.BIT.FP){
+		rci_rconfig.LONG = ioread32(p_rci_rconfig);
+		while(rci_rconfig.BIT.FP) {
 			int i;
-			//rci_rconfig.BIT.END = 0;
-			// TODO : Check receiving port and store in the correct table
-			int tag = rci_rconfig.BIT.TAG; //recevied with tag ?
-			
-	
 			uint16_t pkt_len = rci_rconfig.BIT.RFS;
-			uint32_t * data = kmalloc(pkt_len + pkt_len % 4, GFP_ATOMIC);
+			uint32_t * data = kmalloc(pkt_len + (4 - pkt_len % 4), GFP_ATOMIC);
 			//printk(KERN_INFO "HSR RX interrupt : %d\n", pkt_len);
-			for(i = 0; i < (pkt_len + pkt_len % 4) / 4; i++){
-				data[i] = be32_to_cpu(rci_txrx_data[i]);
-				//printk(KERN_INFO "WORD : %x\n", data[i]);
+
+			for(i = 0; i < (pkt_len + (4 - pkt_len % 4)) / 4; i++) {
+				data[i] = be32_to_cpu(ioread32(&rci_txrx_data[i]));
 			}
 			if(zhaw_hsr_is_supervision(data, pkt_len)) {
 				printk(KERN_INFO "Supervision frame received\n");
@@ -866,24 +880,23 @@ static irqreturn_t zhaw_hsr_irq(int a, void* dev){
 			}
 			if(rci_rconfig.BIT.TAG)
 				zhaw_hsr_add_node_to_table(((uint8_t *) data) + 6);
-			skb = netdev_alloc_skb_ip_align(ndev, pkt_len);
-			skb_copy_to_linear_data(skb, data, pkt_len);
-			skb_put(skb, pkt_len);
-			skb->protocol = eth_type_trans(skb, ndev);
-			netif_rx(skb);
-			
+
+			//Tell hardware frame has been read
 			rci_rconfig.BIT.RFD = 1;
-			*p_rci_rconfig = rci_rconfig.LONG;
-			rci_rconfig.LONG = *p_rci_rconfig;
+			iowrite32(rci_rconfig.LONG, p_rci_rconfig);
+			rci_rconfig.LONG = ioread32(p_rci_rconfig);
+
+			//Send to upper layer
+			zhaw_hsr_rx(ndev, (uint8_t*) data, pkt_len);
 			kfree(data);
 		}
 
 	}
 	if(rci_int & 0x2) { // TX interrupt, nothing to do
 	}
-		//printk(KERN_INFO "IRQ Handled\n");
-	
-	//spin_unlock_irqrestore(&ioread_lock, irqflags); 
+	//printk(KERN_INFO "IRQ Handled\n");
+
+	//spin_unlock_irqrestore(&ioread_lock, irqflags);
 	return IRQ_HANDLED;
 }
 static int zhaw_hsr_switch_port_open(struct net_device *dev)
@@ -911,43 +924,57 @@ static netdev_tx_t zhaw_hsr_switch_port_start_xmit(struct sk_buff *skb,
                                                    struct net_device *ndev)
 {
 	struct zhaw_hsr *data = dev_get_drvdata(&ndev->dev);
-	
 	uint32_t __iomem * p_rci_wconfig = data->regs_cpu;
 	uint32_t __iomem * rci_txrx_data = data->regs_cpu + 0xC;
 	union REG_RCI_WCONFIG rci_wconfig;
 	int i;
-	
-	//spin_lock(&ioread_lock);
-	//printk(KERN_INFO "XMIT LEN: %d\n", skb->len);
-	for(i = 0; i < skb->len;i += 4){
-		uint32_t word = *(uint32_t*) (skb->data + i);
-		//printk(KERN_INFO "XMIT: %x\n", cpu_to_be32(word));
-		rci_txrx_data[i / 4] = cpu_to_be32(word);
+	spin_lock(&ioread_lock);
+	rci_wconfig.LONG = ioread32(p_rci_wconfig);
+	while(rci_wconfig.BIT.SB) {
+		rci_wconfig.LONG = ioread32(p_rci_wconfig);
 	}
+	//Setup send config
 	rci_wconfig.BIT.SB = 0; //start sending
-	rci_wconfig.BIT.END = 0; //Big endian
+	rci_wconfig.BIT.END = 1; //little endian
 	rci_wconfig.BIT.PTH = 0; //path field of hsr tag
-	if(zhaw_hsr_is_node_in_table(skb->data)){
-		rci_wconfig.BIT.TAG = 1; //Send with tag
-	}
-	else
-		rci_wconfig.BIT.TAG = 0; //Send with tag
+	/*
+	    if(zhaw_hsr_is_node_in_table(skb->data)) {
+	            rci_wconfig.BIT.TAG = 1; //Send with tag
+	    }
+	    else
+	            rci_wconfig.BIT.TAG = 0; //Send with tag
+	 */
+	rci_wconfig.BIT.TAG = 1;
 	rci_wconfig.BIT.A = 1; //send to port A
 	rci_wconfig.BIT.B = 1; //Send to port B
 	rci_wconfig.BIT.WFS = skb->len > 60 ? skb->len : 60; //frame length
 	rci_wconfig.BIT.I = 0; //do not send to interlink
 	iowrite32(rci_wconfig.LONG, p_rci_wconfig);
-	
-	rci_wconfig.BIT.SB = 1; //start sending
+
+	//Write frame
+	//printk(KERN_INFO "XMIT LEN: %d\n", skb->len);
+	for(i = 0; i < skb->len; i += 4) {
+		uint32_t word = *(uint32_t*) (skb->data + i);
+		//printk(KERN_INFO "XMIT: %x\n", cpu_to_be32(word));
+		iowrite32(cpu_to_le32(word), &rci_txrx_data[i / 4]);
+	}
+
+	//Send frame
+	rci_wconfig.BIT.SB = 1;
 	iowrite32(rci_wconfig.LONG, p_rci_wconfig);
-	
-	//spin_unlock(&ioread_lock);
+
+	//Update stats
+	ndev->stats.tx_packets++;
+	ndev->stats.tx_bytes += skb->len;
+	dev_consume_skb_any(skb);
+	spin_unlock(&ioread_lock);
 	return NETDEV_TX_OK;
 }
 
 static int zhaw_hsr_switch_port_change_mtu(struct net_device *dev, int new_mtu)
 {
 	printk(KERN_INFO "zhaw_hsr_switch_port_change_mtu\n");
+	dev->mtu = new_mtu;
 	return 0;
 }
 
@@ -964,50 +991,48 @@ static const struct net_device_ops zhaw_hsr_switch_netdev_ops = {
 	.ndo_change_mtu         = zhaw_hsr_switch_port_change_mtu,
 };
 
-static int register_eth_device(struct device * dev, struct zhaw_hsr * data){
-	data->ndev = alloc_etherdev(sizeof(struct zhaw_hsr));
-	data->ndev->netdev_ops = &zhaw_hsr_switch_netdev_ops;
-	printk(KERN_INFO "register_eth_device");
-
-	if(register_netdev(data->ndev) != 0){
-		dev_err(dev, "Could not register ethernet device\n");
-		return -1;
-	}
-	
-	dev_set_drvdata(&data->ndev->dev, data);
-	printk(KERN_INFO "register_eth_device : success\n");
-	return 0;
-}
 static int zhaw_hsr_probe(struct platform_device *pdev)
 {
-	struct device *dev = &pdev->dev;
+	struct net_device *ndev;
 	struct zhaw_hsr *data;
 	struct resource *res;
 	int err;
 	uint32_t val;
 
-	data = devm_kzalloc(dev, sizeof(struct zhaw_hsr), GFP_KERNEL);
-	data->dev = dev;
+	/* Register ethernet device */
+	ndev = alloc_etherdev(sizeof(struct zhaw_hsr));
+	ndev->netdev_ops = &zhaw_hsr_switch_netdev_ops;
+	SET_NETDEV_DEV(ndev, &pdev->dev);
+
+	if(register_netdev(ndev) != 0) {
+		netdev_err(ndev, "Could not register ethernet device\n");
+		return -1;
+	}
+
+	/* Alloc memory */
+	data = devm_kzalloc(&pdev->dev, sizeof(struct zhaw_hsr), GFP_KERNEL);
+	data->ndev = ndev;
+
 	/* Get memory regions */
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	data->regs_cpu = devm_ioremap_resource(dev, res);
+	data->regs_cpu = devm_ioremap_resource(&ndev->dev, res);
 	if (IS_ERR(data->regs_cpu))
 		return PTR_ERR(data->regs_cpu);
+
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
-	data->regs = devm_ioremap_resource(dev, res);
-	dev_info(data->dev, "HSR main regs : %p\n", data->regs);
+	data->regs = devm_ioremap_resource(&pdev->dev, res);
 	if (IS_ERR(data->regs))
 		return PTR_ERR(data->regs);
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 2);
-	data->regs_ptp = devm_ioremap_resource(dev, res);
+	data->regs_ptp = devm_ioremap_resource(&pdev->dev, res);
 	if (IS_ERR(data->regs_ptp))
 		return PTR_ERR(data->regs_ptp);
 
 	/* Get clocks */
-	data->clk_100mhz = devm_clk_get(dev, "100MHz");
-	data->clk_50mhz = devm_clk_get(dev, "50MHz");
-	data->clk_pclk = devm_clk_get(dev, "apb_pclk");
+	data->clk_100mhz = devm_clk_get(&pdev->dev, "100MHz");
+	data->clk_50mhz = devm_clk_get(&pdev->dev, "50MHz");
+	data->clk_pclk = devm_clk_get(&pdev->dev, "apb_pclk");
 
 	if (IS_ERR(data->clk_100mhz) ||
 	    IS_ERR(data->clk_50mhz) ||
@@ -1018,19 +1043,19 @@ static int zhaw_hsr_probe(struct platform_device *pdev)
 	/* Enable clocks */
 	err = clk_prepare_enable(data->clk_100mhz);
 	if (err) {
-		dev_err(dev, "could not enable 100MHz clk\n");
+		dev_err(&pdev->dev, "could not enable 100MHz clk\n");
 		goto err_clk;
 	}
 
 	err = clk_prepare_enable(data->clk_50mhz);
 	if (err) {
-		dev_err(dev, "could not enable 50MHz clk\n");
+		dev_err(&pdev->dev, "could not enable 50MHz clk\n");
 		goto err_clk;
 	}
 
 	err = clk_prepare_enable(data->clk_pclk);
 	if (err) {
-		dev_err(dev, "could not enable apb_pclk\n");
+		dev_err(&pdev->dev, "could not enable apb_pclk\n");
 		goto err_clk;
 	}
 
@@ -1051,27 +1076,19 @@ static int zhaw_hsr_probe(struct platform_device *pdev)
 	rzn1_sysctrl_writel(val, RZN1_SYSCTRL_REG_PWRCTRL_HSR);
 
 	mdelay(10);
-	
-	/* create a main kobject structure sys/lre */
-	/*
-	dev->kobj = kobject_create_and_add("zhaw-hsr", NULL);
-	if (!data->lre_kobj) {
-		printk(KERN_INFO "lre create failed\n");
-		return -ENOMEM;
-	}
-	*/
+
 	lre_registers_init();
 	/* create the lre group with its attributes */
-	err = sysfs_create_group(&dev->kobj, &register_group);
+	err = sysfs_create_group(&pdev->dev.kobj, &register_group);
 	if (err) {
-		kobject_put(&dev->kobj);
+		kobject_put(&pdev->dev.kobj);
 		return err;
 	}
-	
+
 	/* create the mib group with its attribues */
-	err = sysfs_create_group(&dev->kobj, &mib_group);
+	err = sysfs_create_group(&pdev->dev.kobj, &mib_group);
 	if (err) {
-		kobject_put(&dev->kobj);
+		kobject_put(&pdev->dev.kobj);
 		return err;
 	}
 
@@ -1081,16 +1098,15 @@ static int zhaw_hsr_probe(struct platform_device *pdev)
 		printk(KERN_INFO "Reading hsr irq failed: %d\n", err);
 		return err;
 	}
-	//Register Interurpt handler
-	err = request_irq(err, zhaw_hsr_irq, IRQF_SHARED, "zhaw-hsr", dev);
-	if(err < 0){
+	/* Register Interurpt handler */
+	err = request_irq(err, zhaw_hsr_irq, IRQF_SHARED, "zhaw-hsr", ndev);
+	if(err < 0) {
 		printk(KERN_INFO "HSR IRQ  request failed : %d\n", err);
 		return err;
 	}
-	
-	/* Configure ethernet device */
-	register_eth_device(dev, data);
-	dev_set_drvdata(dev, data);
+
+	dev_set_drvdata(&ndev->dev, data);
+	dev_set_drvdata(&pdev->dev, data);
 	return 0;
 
 err_clk:
@@ -1107,36 +1123,32 @@ err_clk:
 static int zhaw_hsr_remove(struct platform_device *pdev)
 {
 	struct zhaw_hsr *data;
-	uint32_t val;
-	
+	int err;
+
 	data = dev_get_drvdata(&pdev->dev);
-	
-	//Remove netdevice
-	unregister_netdev(data->ndev);
-	//Remove nodes in sysfs
+
+	/* Unregister interrupt */
+	err = platform_get_irq_byname(pdev, "cpu_irq");
+	if(err < 0) {
+		printk(KERN_INFO "Reading hsr irq failed: %d\n", err);
+		return err;
+	}
+	free_irq(err, data->ndev);
+
+	/* Remove nodes in sysfs */
 	sysfs_remove_group(&pdev->dev.kobj, &mib_group);
 	sysfs_remove_group(&pdev->dev.kobj, &register_group);
-	
-	//kobject_del(&pdev->dev.kobj);
 
-	/* Reset A domain */
-	val = rzn1_sysctrl_readl(RZN1_SYSCTRL_REG_PWRCTRL_HSR);
-	val &= ~(1 << RZN1_SYSCTRL_REG_PWRCTRL_HSR_RSTN_A);
-	rzn1_sysctrl_writel(val, RZN1_SYSCTRL_REG_PWRCTRL_HSR);
-
-	/* Reset C domain */
-	val = rzn1_sysctrl_readl(RZN1_SYSCTRL_REG_PWRCTRL_HSR);
-	val &= ~(1 << RZN1_SYSCTRL_REG_PWRCTRL_HSR_RSTN_C);
-	rzn1_sysctrl_writel(val, RZN1_SYSCTRL_REG_PWRCTRL_HSR);
-
-	
 	/* Disable clocks */
 	clk_disable_unprepare(data->clk_pclk);
 	clk_disable_unprepare(data->clk_50mhz);
 	clk_disable_unprepare(data->clk_100mhz);
-	
-	
-	mdelay(10);
+
+
+	/* Remove netdevice */
+	unregister_netdev(data->ndev);
+	free_netdev(data->ndev);
+
 	return 0;
 }
 

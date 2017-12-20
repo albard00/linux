@@ -77,9 +77,9 @@ union REG_RCI_WCONFIG                                            /* Offset=0x000
         unsigned long   B:1;                                        /* [18] */
         unsigned long   TAG:1;                                      /* [19] */
         unsigned long   PTH:4;                                      /* [23:20] */
-        unsigned long   :5;                                         /* [28:24] */
-        unsigned long   END:1;                                      /* [29] */
-        unsigned long   :1;                                         /* [30] */
+        unsigned long   :4;                                         /* [27:24] */
+        unsigned long   END:1;                                      /* [28] */
+        unsigned long   :2;                                         /* [30:29] */
         unsigned long   SB:1;                                       /* [31] */
     } BIT;
 };
